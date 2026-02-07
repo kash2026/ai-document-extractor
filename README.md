@@ -1,17 +1,18 @@
 # AI Document Extraction Service
 
-A **schema-driven** universal document extractor using OCR + LLM. This service accepts documents (file upload or URL) and a JSON schema, then returns structured JSON data extracted from the document following the schema exactly.
+A **schema-driven** universal document extractor using **multimodal LLMs (no OCR)**. This service accepts documents (file upload or URL) and a JSON schema, then returns structured JSON data extracted directly from the document following the schema exactly.
 
 ## Features
 
 - ✅ **Schema-driven extraction** - Define exact fields and types via JSON schema
+- ✅ Direct document → LLM (no OCR required)
 - ✅ File upload or URL-based document processing
 - ✅ Support for images (PNG, JPG, JPEG, GIF, BMP, TIFF, WEBP) and PDFs
-- ✅ Multi-page PDF support
+- ✅ Multi-page PDF support (first page used for multimodal extraction)
 - ✅ **Strict validation** - Ensures output matches schema exactly
 - ✅ **Automatic retry** - Retries once if validation fails
-- ✅ Text cleanup and normalization
-- ✅ Gemini Flash API integration with OpenAI fallback
+- ✅ OpenAI Responses API (gpt-4.1-mini) with Gemini fallback
+- ✅ Multimodal extraction (image/PDF sent directly to LLM)
 - ✅ Comprehensive error handling and logging
 - ✅ Temperature = 0 for consistent results
 
@@ -47,11 +48,11 @@ A **schema-driven** universal document extractor using OCR + LLM. This service a
    Create a `.env` file in the project root:
    ```bash
    # .env file
-   GEMINI_API_KEY=your_gemini_api_key_here
-   OPENAI_API_KEY=your_openai_api_key_here  # Optional, used as fallback
+   OPENAI_API_KEY=your_openai_api_key_here   # Primary multimodal extraction
+   GEMINI_API_KEY=your_gemini_api_key_here   # Optional fallback
    ```
    
-   **Note:** At least one API key (GEMINI_API_KEY or OPENAI_API_KEY) must be set.
+   Note: OPENAI_API_KEY is recommended (gpt-4.1-mini). Gemini is optional fallback.
 
 ## Running the Server
 
@@ -166,17 +167,13 @@ curl -X POST "http://localhost:8000/extract" \
 ### Processing Pipeline
 
 ```
-Input API
+Input API (File / URL)
     ↓
-OCR (mock for now – hook for Google Vision later)
+Load Document (image / PDF)
     ↓
-Text Cleanup / Normalization
+Multimodal LLM (document + schema)
     ↓
-Schema Builder (from user input)
-    ↓
-LLM Extraction (STRICT system prompt)
-    ↓
-Validation
+Validation Layer
     ↓
 Retry once if invalid
     ↓
@@ -187,23 +184,19 @@ Structured JSON
 
 1. **Input Validation:** Checks for file or URL, validates schema JSON
 2. **File Acquisition:** Downloads from URL or uses uploaded file
-3. **Text Extraction:**
-   - PDFs: Converted to images (multi-page support), then OCR
-   - Images: Direct OCR processing
-   - Currently uses mock OCR (placeholder for Google Vision/Tesseract)
-4. **Text Cleanup:** Normalizes whitespace, line breaks, removes artifacts
-5. **Schema Builder:** Converts user schema to LLM-readable format
-6. **LLM Extraction:**
-   - Sends document text + schema to Gemini Flash (or OpenAI fallback)
+3. **Document Loading:** Converts PDF/image for multimodal LLM input
+4. **Schema Builder:** Converts user schema to strict extraction prompt
+5. **LLM Extraction:**
+   - Sends document + schema to OpenAI gpt-4.1-mini (multimodal)
    - Uses strict system prompt enforcing schema compliance
    - Temperature = 0 for consistent results
-7. **Validation Layer:**
+6. **Validation Layer:**
    - Ensures all schema keys exist
    - Removes extra fields
    - Fills missing keys with null
-   - Validates types (basic)
+   - Validates basic types
    - Retries once if invalid
-8. **Response Formatting:** Returns validated JSON matching schema exactly
+7. **Response Formatting:** Returns validated JSON matching schema exactly
 
 ### Strict System Prompt
 
@@ -256,8 +249,8 @@ All errors return readable JSON responses with appropriate HTTP status codes.
 
 - **Max file size:** 10MB (configurable in `main.py`)
 - **Supported formats:** PNG, JPG, JPEG, GIF, BMP, TIFF, WEBP, PDF
+- **LLM model:** OpenAI gpt-4.1-mini
 - **LLM temperature:** 0 (for consistent extraction)
-- **OCR:** Currently mock/placeholder (ready for Google Vision integration)
 - **Retry attempts:** 1 (configurable in code)
 
 ## Example Schemas
@@ -298,15 +291,13 @@ All errors return readable JSON responses with appropriate HTTP status codes.
 
 ## Future Enhancements
 
-- [ ] Integrate Google Vision API for real OCR
-- [ ] Add Tesseract OCR as alternative
-- [ ] Support for nested object schemas
-- [ ] Support for required/optional field markers
-- [ ] More sophisticated type validation
+- [ ] Multi-page multimodal PDF support
+- [ ] CRM field mapper integration
+- [ ] Original document + extracted preview UI
 - [ ] Batch processing endpoint
-- [ ] Caching for repeated extractions
+- [ ] Confidence scoring
+- [ ] Authentication / API keys
 - [ ] Rate limiting
-- [ ] Authentication/API keys
 
 ## Troubleshooting
 
