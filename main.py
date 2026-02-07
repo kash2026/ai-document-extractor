@@ -1,10 +1,11 @@
 """
 AI-Based Document Extraction Service
-Schema-driven universal document extractor using OCR + LLM
+Schema-driven universal document extractor using Multimodal LLM (no OCR)
 """
 
 import os
 import io
+import base64
 import json
 import logging
 import tempfile
@@ -93,77 +94,35 @@ def download_file_from_url(url: str) -> bytes:
         raise HTTPException(status_code=400, detail=f"Failed to download file from URL: {str(e)}")
 
 
-def convert_pdf_to_images(pdf_bytes: bytes) -> list[Image.Image]:
-    """Convert PDF bytes to list of PIL Images"""
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-            tmp_file.write(pdf_bytes)
-            tmp_path = tmp_file.name
-        
-        images = pdf2image.convert_from_path(tmp_path, dpi=200)
-        os.unlink(tmp_path)  # Clean up temp file
-        logger.info(f"Converted PDF to {len(images)} images")
-        return images
-    except Exception as e:
-        logger.error(f"Error converting PDF to images: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to process PDF: {str(e)}")
 
-
-def mock_ocr_from_image(image: Image.Image) -> str:
+# --- Multimodal LLM document loader ---
+def load_document_as_images(file_bytes: bytes, filename: str) -> list[Image.Image]:
     """
-    Mock OCR - returns placeholder text
-    TODO: Replace with Google Vision OCR or Tesseract
+    Load document into image(s) for multimodal LLM.
+    Images are sent directly to LLM (no OCR).
     """
-    # For POC, return a mock text
-    # In production, use: pytesseract.image_to_string(image) or Google Vision API
-    logger.info("Using mock OCR (placeholder)")
-    return f"[MOCK OCR TEXT from image: {image.size[0]}x{image.size[1]} pixels]"
-
-
-def extract_text_from_file(file_bytes: bytes, filename: str) -> str:
-    """Extract text from file (image or PDF)"""
     file_ext = Path(filename).suffix.lower()
-    
-    if file_ext == SUPPORTED_PDF_FORMAT:
-        # Convert PDF to images and extract text from each page
-        images = convert_pdf_to_images(file_bytes)
-        texts = []
-        for i, image in enumerate(images):
-            text = mock_ocr_from_image(image)
-            texts.append(f"--- Page {i+1} ---\n{text}")
-        return "\n\n".join(texts)
-    
-    elif file_ext in SUPPORTED_IMAGE_FORMATS:
-        # Process image directly
+
+    if file_ext == ".pdf":
         try:
-            image = Image.open(io.BytesIO(file_bytes))
-            return mock_ocr_from_image(image)
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+                tmp_file.write(file_bytes)
+                tmp_path = tmp_file.name
+
+            images = pdf2image.convert_from_path(tmp_path, dpi=200)
+            os.unlink(tmp_path)
+            return images
         except Exception as e:
-            logger.error(f"Error processing image: {e}")
-            raise HTTPException(status_code=500, detail=f"Failed to process image: {str(e)}")
-    
+            raise HTTPException(status_code=500, detail=f"Failed to load PDF: {str(e)}")
+
+    elif file_ext in SUPPORTED_IMAGE_FORMATS:
+        try:
+            return [Image.open(io.BytesIO(file_bytes))]
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to load image: {str(e)}")
+
     else:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported file format: {file_ext}. Supported: {', '.join(SUPPORTED_IMAGE_FORMATS | {SUPPORTED_PDF_FORMAT})}"
-        )
-
-
-def cleanup_text(text: str) -> str:
-    """
-    Text Cleanup / Normalization
-    - Remove excessive whitespace
-    - Normalize line breaks
-    - Remove special characters that might interfere
-    """
-    # Normalize whitespace
-    text = re.sub(r'\s+', ' ', text)
-    # Normalize line breaks
-    text = re.sub(r'\n\s*\n', '\n\n', text)
-    # Remove leading/trailing whitespace from each line
-    lines = [line.strip() for line in text.split('\n')]
-    text = '\n'.join(lines)
-    return text.strip()
+        raise HTTPException(status_code=400, detail=f"Unsupported file format: {file_ext}")
 
 
 def build_schema_prompt(schema: Dict[str, str]) -> str:
@@ -176,102 +135,95 @@ def build_schema_prompt(schema: Dict[str, str]) -> str:
     return schema_description
 
 
-def call_llm_for_extraction(raw_text: str, schema: Dict[str, str], is_retry: bool = False) -> Dict[str, Any]:
-    """
-    Call LLM (Gemini Flash or OpenAI) to extract structured data following schema
-    
-    Args:
-        raw_text: OCR extracted text
-        schema: Dictionary mapping field names to types (e.g., {"customer_name": "string"})
-        is_retry: Whether this is a retry attempt after validation failure
-    """
-    # STRICT SYSTEM PROMPT
+
+# --- Multimodal LLM extraction ---
+def call_llm_for_extraction(images: list[Image.Image], schema: Dict[str, str], is_retry: bool = False) -> Dict[str, Any]:
+
     system_instruction = (
         "You are a document extraction engine.\n\n"
         "Rules:\n"
-        "- Extract ONLY from provided text.\n"
+        "- Extract ONLY from provided document.\n"
         "- Do NOT infer or guess.\n"
         "- Output VALID JSON only.\n"
         "- Follow schema EXACTLY.\n"
         "- Missing values must be null.\n"
         "- No extra keys allowed."
     )
-    
-    # Build schema description
-    schema_prompt = build_schema_prompt(schema)
-    
-    # Add retry instruction if needed
+
     if is_retry:
         system_instruction += "\n\nFix output to exactly match schema. Return JSON only."
-    
-    user_message = f"""Schema to Extract:
+
+    schema_prompt = json.dumps(schema, indent=2)
+
+    user_message = f"""
+Schema:
 {schema_prompt}
 
-Document Text:
-{raw_text}
+Extract fields from the attached document.
+Return ONLY valid JSON.
+"""
 
-Extract the fields according to the schema. Return ONLY valid JSON matching the schema exactly."""
-
-    # Try Gemini first, fallback to OpenAI
+    # Gemini (primary)
     if gemini_model:
         try:
-            logger.info(f"Calling Gemini Flash API {'(retry)' if is_retry else ''}")
+            content = [f"{system_instruction}\n\n{user_message}"] + images
+
             response = gemini_model.generate_content(
-                f"{system_instruction}\n\n{user_message}",
+                content,
                 generation_config={
                     "temperature": 0,
                     "max_output_tokens": 2048,
                 }
             )
+
             result_text = response.text.strip()
-            # Remove markdown code blocks if present
-            if result_text.startswith("```json"):
-                result_text = result_text[7:]
+
             if result_text.startswith("```"):
-                result_text = result_text[3:]
-            if result_text.endswith("```"):
-                result_text = result_text[:-3]
-            result_text = result_text.strip()
-            
+                result_text = result_text.replace("```json", "").replace("```", "").strip()
+
             return json.loads(result_text)
+
         except Exception as e:
-            logger.warning(f"Gemini API call failed: {e}, trying OpenAI fallback")
-    
-    # Fallback to OpenAI
+            logger.warning(f"Gemini failed: {e}, trying OpenAI fallback")
+
+    # OpenAI fallback (multimodal via Responses API)
     if openai_client:
         try:
-            logger.info(f"Calling OpenAI API {'(retry)' if is_retry else ''}")
-            response = openai_client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": system_instruction},
-                    {"role": "user", "content": user_message}
-                ],
-                temperature=0,
-                max_tokens=2048
+            buf = io.BytesIO()
+            images[0].save(buf, format="PNG")
+            img_b64 = base64.b64encode(buf.getvalue()).decode()
+
+            response = openai_client.responses.create(
+                model="gpt-4.1-mini",
+                input=[
+                    {
+                        "role": "system",
+                        "content": system_instruction
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": user_message},
+                            {
+                                "type": "input_image",
+                                "image_url": f"data:image/png;base64,{img_b64}"
+                            }
+                        ]
+                    }
+                ]
             )
-            result_text = response.choices[0].message.content.strip()
-            # Remove markdown code blocks if present
-            if result_text.startswith("```json"):
-                result_text = result_text[7:]
+
+            result_text = response.output_text.strip()
+
             if result_text.startswith("```"):
-                result_text = result_text[3:]
-            if result_text.endswith("```"):
-                result_text = result_text[:-3]
-            result_text = result_text.strip()
-            
+                result_text = result_text.replace("```json", "").replace("```", "").strip()
+
             return json.loads(result_text)
+
         except Exception as e:
-            logger.error(f"OpenAI API call failed: {e}")
-            raise HTTPException(
-                status_code=500,
-                detail=f"LLM extraction failed: {str(e)}"
-            )
-    
-    raise HTTPException(
-        status_code=500,
-        detail="No LLM API key configured. Please set GEMINI_API_KEY or OPENAI_API_KEY environment variable."
-    )
+            raise HTTPException(status_code=500, detail=f"LLM extraction failed: {str(e)}")
+
+    raise HTTPException(status_code=500, detail="No LLM API key configured")
 
 
 def validate_type(value: Any, expected_type: str) -> bool:
@@ -434,36 +386,27 @@ async def extract_from_file_or_url(
                 detail="Either 'file' or 'file_url' must be provided"
             )
         
-        # Step 1: Extract text using OCR (mock for now)
-        logger.info("Extracting text from document...")
-        raw_text = extract_text_from_file(file_bytes, filename)
-        logger.info(f"Extracted {len(raw_text)} characters of text")
-        
-        # Step 2: Text Cleanup / Normalization
-        logger.info("Cleaning and normalizing text...")
-        cleaned_text = cleanup_text(raw_text)
-        
-        # Step 3: Call LLM for extraction
+        logger.info("Loading document for multimodal LLM...")
+        images = load_document_as_images(file_bytes, filename)
+
         logger.info("Calling LLM for structured extraction...")
-        extracted_data = call_llm_for_extraction(cleaned_text, schema_dict, is_retry=False)
-        
-        # Step 4: Validation
+        extracted_data = call_llm_for_extraction(images, schema_dict, is_retry=False)
+
         logger.info("Validating extracted data...")
         is_valid, validated_data = validate_output(extracted_data, schema_dict)
-        
-        # Step 5: Retry once if invalid
+
         if not is_valid:
             logger.warning("Initial extraction failed validation, retrying...")
-            extracted_data_retry = call_llm_for_extraction(cleaned_text, schema_dict, is_retry=True)
+            extracted_data_retry = call_llm_for_extraction(images, schema_dict, is_retry=True)
             is_valid_retry, validated_data_retry = validate_output(extracted_data_retry, schema_dict)
-            
+
             if is_valid_retry:
                 validated_data = validated_data_retry
                 logger.info("Retry succeeded")
             else:
                 logger.warning("Retry also failed validation, using fixed data")
                 validated_data = validate_and_fix_output(extracted_data_retry, schema_dict)
-        
+
         return ExtractionResponse(
             success=True,
             data=validated_data,
