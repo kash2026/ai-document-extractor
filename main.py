@@ -11,7 +11,8 @@ import logging
 import tempfile
 import re
 from typing import Optional, Dict, Any, Tuple
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Header
+from fastapi.responses import HTMLResponse
 from pathlib import Path
 
 import httpx
@@ -19,6 +20,7 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 from PIL import Image
 import pdf2image
+import fitz  # PyMuPDF
 import google.generativeai as genai
 from openai import OpenAI
 
@@ -51,6 +53,27 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
 SUPPORTED_IMAGE_FORMATS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff", ".webp"}
 SUPPORTED_PDF_FORMAT = ".pdf"
+
+# --- API Security ---
+API_TOKEN = os.getenv("API_TOKEN", "kelsa-secret-token")
+
+def verify_token(authorization: str = Header(None)):
+    # Enforce strict token validation
+
+    if authorization is None:
+        raise HTTPException(status_code=401, detail="Missing Authorization header")
+
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid Authorization format")
+
+    parts = authorization.split(" ")
+    if len(parts) != 2 or not parts[1]:
+        raise HTTPException(status_code=401, detail="Invalid Authorization format")
+
+    token = parts[1]
+
+    if token != API_TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid API token")
 
 # Initialize LLM clients
 if GEMINI_API_KEY:
@@ -125,6 +148,19 @@ def load_document_as_images(file_bytes: bytes, filename: str) -> list[Image.Imag
         raise HTTPException(status_code=400, detail=f"Unsupported file format: {file_ext}")
 
 
+# --- PDF text extraction helper ---
+def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
+    """Extract text from PDF using PyMuPDF"""
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        text_parts = []
+        for page in doc:
+            text_parts.append(page.get_text() or "")
+        return "\n".join(text_parts).strip()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to extract text from PDF: {str(e)}")
+
+
 def build_schema_prompt(schema: Dict[str, str]) -> str:
     """
     Schema Builder - Convert user schema to LLM-readable format
@@ -137,13 +173,41 @@ def build_schema_prompt(schema: Dict[str, str]) -> str:
 
 
 # --- Multimodal LLM extraction ---
-def call_llm_for_extraction(images: list[Image.Image], schema: Dict[str, str], is_retry: bool = False) -> Dict[str, Any]:
+from typing import Optional
+
+# --- Helper: Clean LLM JSON output ---
+def clean_llm_json(text: str) -> str:
+    import re
+    if not text:
+        return text
+    t = text.strip()
+    # remove markdown fences
+    t = re.sub(r"```json", "", t, flags=re.IGNORECASE)
+    t = re.sub(r"```", "", t)
+    # extract first JSON object
+    m = re.search(r"\{.*\}", t, re.DOTALL)
+    if m:
+        t = m.group(0)
+    # remove trailing commas
+    t = re.sub(r",\s*}", "}", t)
+    t = re.sub(r",\s*]", "]", t)
+    return t.strip()
+
+def call_llm_for_extraction(
+    images: Optional[list[Image.Image]] = None,
+    text: Optional[str] = None,
+    schema: Dict[str, str] = None,
+    is_retry: bool = False
+) -> Dict[str, Any]:
 
     system_instruction = (
         "You are a document extraction engine.\n\n"
         "Rules:\n"
         "- Extract ONLY from provided document.\n"
-        "- Do NOT infer or guess.\n"
+        "- Extract from visible text OR clearly identifiable context (logo, header, branding).\n"
+        "- For certificates/documents, organization is usually present in header, logo, or issuing authority section. Extract that as organization.\n"
+        "- Prefer official organization names (e.g., Infosys, Google, TCS) if clearly visible.\n"
+        "- Do NOT hallucinate beyond document context.\n"
         "- Output VALID JSON only.\n"
         "- Follow schema EXACTLY.\n"
         "- Missing values must be null.\n"
@@ -155,7 +219,22 @@ def call_llm_for_extraction(images: list[Image.Image], schema: Dict[str, str], i
 
     schema_prompt = json.dumps(schema, indent=2)
 
-    user_message = f"""
+    if text:
+        user_message = f"""
+Schema:
+{schema_prompt}
+
+Document Text:
+{text}
+
+Instructions:
+- Extract all fields strictly.
+- If organization is not explicitly labeled, infer it from header/logo text.
+
+Return ONLY valid JSON.
+"""
+    else:
+        user_message = f"""
 Schema:
 {schema_prompt}
 
@@ -166,7 +245,10 @@ Return ONLY valid JSON.
     # Gemini (primary)
     if gemini_model:
         try:
-            content = [f"{system_instruction}\n\n{user_message}"] + images
+            if text:
+                content = [f"{system_instruction}\n\n{user_message}"]
+            else:
+                content = [f"{system_instruction}\n\n{user_message}"] + images
 
             response = gemini_model.generate_content(
                 content,
@@ -177,10 +259,8 @@ Return ONLY valid JSON.
             )
 
             result_text = response.text.strip()
-
-            if result_text.startswith("```"):
-                result_text = result_text.replace("```json", "").replace("```", "").strip()
-
+            result_text = clean_llm_json(result_text)
+            print("GEMINI CLEANED:", result_text)
             return json.loads(result_text)
 
         except Exception as e:
@@ -189,6 +269,20 @@ Return ONLY valid JSON.
     # OpenAI fallback (multimodal via Responses API)
     if openai_client:
         try:
+            if text:
+                response = openai_client.responses.create(
+                    model="gpt-4.1-mini",
+                    input=[
+                        {"role": "system", "content": system_instruction},
+                        {"role": "user", "content": user_message}
+                    ]
+                )
+                result_text = response.output_text.strip()
+                result_text = clean_llm_json(result_text)
+                print("OPENAI TEXT CLEANED:", result_text)
+                return json.loads(result_text)
+
+            # otherwise image flow continues below
             buf = io.BytesIO()
             images[0].save(buf, format="PNG")
             img_b64 = base64.b64encode(buf.getvalue()).decode()
@@ -214,10 +308,8 @@ Return ONLY valid JSON.
             )
 
             result_text = response.output_text.strip()
-
-            if result_text.startswith("```"):
-                result_text = result_text.replace("```json", "").replace("```", "").strip()
-
+            result_text = clean_llm_json(result_text)
+            print("OPENAI IMAGE CLEANED:", result_text)
             return json.loads(result_text)
 
         except Exception as e:
@@ -320,10 +412,187 @@ def validate_output(extracted_data: Dict[str, Any], schema: Dict[str, str]) -> T
     return True, extracted_data
 
 
-@app.get("/")
-async def health_check():
-    """Health check endpoint"""
-    return {"status": "running"}
+
+@app.get("/", response_class=HTMLResponse)
+async def web_ui():
+    return """
+    <html>
+    <head>
+        <title>AI Document Extraction</title>
+        <style>
+            body {
+                font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+                background: #f5f7fb;
+                margin: 0;
+                padding: 40px;
+            }
+            .card {
+                background: white;
+                padding: 30px;
+                border-radius: 12px;
+                box-shadow: 0 10px 30px rgba(0,0,0,0.08);
+                max-width: 900px;
+                margin: auto;
+            }
+            h2 {
+                margin-top: 0;
+            }
+            input[type=file], textarea {
+                width: 100%;
+                padding: 12px;
+                border-radius: 8px;
+                border: 1px solid #ddd;
+                margin-top: 10px;
+                margin-bottom: 20px;
+                font-size: 14px;
+            }
+            button {
+                background: #2563eb;
+                color: white;
+                padding: 12px 20px;
+                border: none;
+                border-radius: 8px;
+                cursor: pointer;
+                font-size: 14px;
+            }
+            button:hover {
+                background: #1d4ed8;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="card">
+            <h2> AI Document Extraction Demo</h2>
+            <form action="/preview-extract" method="post" enctype="multipart/form-data">
+                <label><b>Upload Document (PDF/Image)</b></label>
+                <input type="file" name="file" required>
+
+                <label><b>Schema (JSON format)</b></label>
+                <textarea name="schema" placeholder='{"customer_name": "string", "invoice_amount": "number"}' required></textarea>
+
+                <button type="submit">Extract & Preview</button>
+            </form>
+        </div>
+    </body>
+    </html>
+    """
+
+# --- Preview extraction web UI endpoint ---
+
+
+@app.post("/preview-extract", response_class=HTMLResponse)
+async def preview_extract(
+    file: UploadFile = File(...),
+    schema: str = Form(...),
+    authorization: Optional[str] = Header(None)
+):
+    try:
+        verify_token(authorization)
+        schema_dict = json.loads(schema)
+        file_bytes = await file.read()
+        filename = file.filename or "uploaded_file"
+
+        file_ext = Path(filename).suffix.lower()
+
+        if file_ext == ".pdf":
+            text = extract_text_from_pdf_bytes(file_bytes)
+            images = None
+        else:
+            images = load_document_as_images(file_bytes, filename)
+            text = None
+
+        extracted_data = call_llm_for_extraction(images=images, text=text, schema=schema_dict)
+        _, validated_data = validate_output(extracted_data, schema_dict)
+
+        # Preview generation
+        if images:
+            buf = io.BytesIO()
+            images[0].save(buf, format="PNG")
+            img_b64 = base64.b64encode(buf.getvalue()).decode()
+            preview_html = f'<img src="data:image/png;base64,{img_b64}" />'
+        else:
+            pdf_b64 = base64.b64encode(file_bytes).decode()
+            preview_html = f'''
+            <iframe 
+                src="data:application/pdf;base64,{pdf_b64}" 
+                width="100%" 
+                height="600px" 
+                style="border:1px solid #ddd; border-radius:8px;">
+            </iframe>
+            '''
+
+        return f"""
+        <html>
+        <head>
+            <style>
+                body {{
+                    font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+                    background: #f5f7fb;
+                    margin: 0;
+                    padding: 40px;
+                }}
+                .container {{
+                    display: flex;
+                    gap: 30px;
+                }}
+                .card {{
+                    background: white;
+                    padding: 20px;
+                    border-radius: 12px;
+                    box-shadow: 0 10px 30px rgba(0,0,0,0.08);
+                }}
+                .left {{ width: 40%; }}
+                .right {{ width: 60%; }}
+                pre {{
+                    background: #0f172a;
+                    color: #f8fafc;
+                    padding: 15px;
+                    border-radius: 8px;
+                    overflow-x: auto;
+                }}
+                img {{
+                    width: 100%;
+                    border-radius: 8px;
+                    border: 1px solid #ddd;
+                }}
+                .header {{
+                    margin-bottom: 30px;
+                }}
+                .btn {{
+                    margin-top: 20px;
+                    display: inline-block;
+                    padding: 10px 16px;
+                    background: #2563eb;
+                    color: white;
+                    text-decoration: none;
+                    border-radius: 8px;
+                }}
+            </style>
+        </head>
+        <body>
+            <div class="header">
+                <h2> Extraction Result</h2>
+            </div>
+
+            <div class="container">
+                <div class="card left">
+                    <h3>Extracted JSON</h3>
+                    <pre>{json.dumps(validated_data, indent=2)}</pre>
+                </div>
+
+                <div class="card right">
+                    <h3>Document Preview</h3>
+                    {preview_html}
+                </div>
+            </div>
+
+            <a href="/" class="btn">Upload Another Document</a>
+        </body>
+        </html>
+        """
+
+    except Exception as e:
+        return f"<h3>Error: {str(e)}</h3><br><a href='/'>Go Back</a>"
 
 
 @app.post(
@@ -335,7 +604,8 @@ async def health_check():
 async def extract_from_file_or_url(
     file: UploadFile = File(..., description="Upload a document file (PDF or image)"),
     file_url: Optional[str] = Form(None, description="URL of the document to process"),
-    schema: str = Form(..., description="JSON schema string defining fields to extract (e.g., {\"customer_name\": \"string\", \"invoice_amount\": \"number\"})")
+    schema: str = Form(..., description="JSON schema string defining fields to extract (e.g., {\"customer_name\": \"string\", \"invoice_amount\": \"number\"})"),
+    authorization: Optional[str] = Header(None)
 ):
     """
     Extract structured data from document using JSON schema
@@ -344,6 +614,7 @@ async def extract_from_file_or_url(
     - schema: JSON string describing fields to extract (e.g., {"customer_name": "string", "gst_number": "string", "invoice_amount": "number"})
     """
     try:
+        verify_token(authorization)
         # Validate input
         if not file and (not file_url or not file_url.strip()):
             raise HTTPException(
@@ -387,17 +658,24 @@ async def extract_from_file_or_url(
             )
         
         logger.info("Loading document for multimodal LLM...")
-        images = load_document_as_images(file_bytes, filename)
+        file_ext = Path(filename).suffix.lower()
+
+        if file_ext == ".pdf":
+            text = extract_text_from_pdf_bytes(file_bytes)
+            images = None
+        else:
+            images = load_document_as_images(file_bytes, filename)
+            text = None
 
         logger.info("Calling LLM for structured extraction...")
-        extracted_data = call_llm_for_extraction(images, schema_dict, is_retry=False)
+        extracted_data = call_llm_for_extraction(images=images, text=text, schema=schema_dict, is_retry=False)
 
         logger.info("Validating extracted data...")
         is_valid, validated_data = validate_output(extracted_data, schema_dict)
 
         if not is_valid:
             logger.warning("Initial extraction failed validation, retrying...")
-            extracted_data_retry = call_llm_for_extraction(images, schema_dict, is_retry=True)
+            extracted_data_retry = call_llm_for_extraction(images=images, text=text, schema=schema_dict, is_retry=True)
             is_valid_retry, validated_data_retry = validate_output(extracted_data_retry, schema_dict)
 
             if is_valid_retry:
@@ -427,6 +705,7 @@ async def extract_from_file_or_url(
             status_code=500,
             detail=f"Internal server error: {str(e)}"
         )
+
 
 
 if __name__ == "__main__":
