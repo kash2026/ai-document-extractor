@@ -95,12 +95,19 @@ else:
     logger.warning("OPENAI_API_KEY not found")
 
 
+
 class ExtractionResponse(BaseModel):
     """Response model for extraction"""
     success: bool
     data: Dict[str, Any]
     filename: Optional[str] = None
     error: Optional[str] = None
+
+
+# New Pydantic model for JSON-based extract endpoint
+class ExtractRequest(BaseModel):
+    file_url: str
+    schema: Dict[str, str]
 
 
 def download_file_from_url(url: str) -> bytes:
@@ -624,68 +631,24 @@ async def preview_extract(
         return f"<h3>Error: {str(e)}</h3><br><a href='/'>Go Back</a>"
 
 
-@app.post(
-    "/extract",
-    response_model=ExtractionResponse,
-    summary="Extract structured data from document",
-    description="Upload a document file or provide a URL, along with a JSON schema to extract structured data"
-)
-async def extract_from_file_or_url(
-    file: Optional[UploadFile] = File(None, description="Upload a document file (PDF or image)"),
-    file_url: Optional[str] = Form(None, description="URL of the document to process"),
-    schema: str = Form(..., description="JSON schema string defining fields to extract (e.g., {\"customer_name\": \"string\", \"invoice_amount\": \"number\"})"),
+# New JSON-based /extract endpoint
+@app.post("/extract", response_model=ExtractionResponse)
+async def extract_from_json(
+    request: ExtractRequest,
     authorization: Optional[str] = Header(None)
 ):
-    """
-    Extract structured data from document using JSON schema
-    
-    - Either file (upload) OR file_url must be provided
-    - schema: JSON string describing fields to extract (e.g., {"customer_name": "string", "gst_number": "string", "invoice_amount": "number"})
-    """
     try:
         verify_token(authorization)
-        # Validate input
-        if not file and (not file_url or not file_url.strip()):
-            raise HTTPException(
-                status_code=400,
-                detail="Either 'file' or 'file_url' must be provided"
-            )
-        
-        if not schema or not schema.strip():
-            raise HTTPException(
-                status_code=400,
-                detail="'schema' is required and cannot be empty"
-            )
-        
-        # Parse schema JSON
-        try:
-            schema_dict = json.loads(schema)
-            if not isinstance(schema_dict, dict):
-                raise HTTPException(
-                    status_code=400,
-                    detail="Schema must be a JSON object"
-                )
-        except json.JSONDecodeError as e:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid JSON schema: {str(e)}"
-            )
-        
-        # Get file bytes and filename
-        if file_url and file_url.strip():
-            logger.info(f"Downloading file from URL: {file_url}")
-            file_bytes = download_file_from_url(file_url)
-            filename = file_url.split("/")[-1] or "downloaded_file"
-        elif file is not None:
-            logger.info(f"Processing uploaded file: {file.filename}")
-            file_bytes = await file.read()
-            filename = file.filename or "uploaded_file"
-        else:
-            raise HTTPException(
-                status_code=400,
-                detail="Either 'file' or 'file_url' must be provided"
-            )
-        
+
+        if not request.file_url:
+            raise HTTPException(status_code=400, detail="file_url is required")
+
+        schema_dict = request.schema
+
+        logger.info(f"Downloading file from URL: {request.file_url}")
+        file_bytes = download_file_from_url(request.file_url)
+        filename = request.file_url.split("/")[-1] or "downloaded_file"
+
         logger.info("Loading document for multimodal LLM...")
         file_ext = Path(filename).suffix.lower()
 
@@ -723,15 +686,9 @@ async def extract_from_file_or_url(
             data=validated_data,
             filename=filename
         )
-    
+
     except HTTPException:
         raise
-    except json.JSONDecodeError as e:
-        logger.error(f"JSON parsing error: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to parse LLM response as JSON: {str(e)}"
-        )
     except Exception as e:
         logger.error(f"Unexpected error in extraction: {e}", exc_info=True)
         raise HTTPException(
