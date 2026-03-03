@@ -104,17 +104,34 @@ class ExtractionResponse(BaseModel):
 
 
 def download_file_from_url(url: str) -> bytes:
-    """Download file from URL"""
+    """Download file from URL with proper headers and validation"""
     try:
-        with httpx.Client(timeout=30.0) as client:
-            response = client.get(url)
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/pdf"
+        }
+
+        with httpx.Client(timeout=30.0, follow_redirects=True) as client:
+            response = client.get(url, headers=headers)
             response.raise_for_status()
-            if len(response.content) > MAX_FILE_SIZE:
+
+            content = response.content
+
+            # Validate it's actually a PDF
+            if not content.startswith(b"%PDF"):
+                raise HTTPException(
+                    status_code=400,
+                    detail="URL did not return a valid PDF file (likely HTML page instead of direct PDF)"
+                )
+
+            if len(content) > MAX_FILE_SIZE:
                 raise HTTPException(
                     status_code=400,
                     detail=f"File size exceeds maximum allowed size of {MAX_FILE_SIZE / 1024 / 1024}MB"
                 )
-            return response.content
+
+            return content
+
     except httpx.HTTPError as e:
         logger.error(f"Error downloading file from URL: {e}")
         raise HTTPException(status_code=400, detail=f"Failed to download file from URL: {str(e)}")
@@ -286,9 +303,17 @@ Return ONLY valid JSON.
                 return json.loads(result_text)
 
             # otherwise image flow continues below
-            buf = io.BytesIO()
-            images[0].save(buf, format="PNG")
-            img_b64 = base64.b64encode(buf.getvalue()).decode()
+            image_inputs = []
+
+            for img in images:
+                buf = io.BytesIO()
+                img.save(buf, format="PNG")
+                img_b64 = base64.b64encode(buf.getvalue()).decode()
+
+                image_inputs.append({
+                    "type": "input_image",
+                    "image_url": f"data:image/png;base64,{img_b64}"
+                })
 
             response = openai_client.responses.create(
                 model="gpt-4.1-mini",
@@ -301,10 +326,7 @@ Return ONLY valid JSON.
                         "role": "user",
                         "content": [
                             {"type": "input_text", "text": user_message},
-                            {
-                                "type": "input_image",
-                                "image_url": f"data:image/png;base64,{img_b64}"
-                            }
+                            *image_inputs
                         ]
                     }
                 ]
@@ -499,7 +521,11 @@ async def preview_extract(
 
         if file_ext == ".pdf":
             text = extract_text_from_pdf_bytes(file_bytes)
-            images = None
+            if not text or len(text.strip()) < 500:
+                images = load_document_as_images(file_bytes, filename)
+                text = None
+            else:
+                images = None
         else:
             images = load_document_as_images(file_bytes, filename)
             text = None
@@ -605,7 +631,7 @@ async def preview_extract(
     description="Upload a document file or provide a URL, along with a JSON schema to extract structured data"
 )
 async def extract_from_file_or_url(
-    file: UploadFile = File(..., description="Upload a document file (PDF or image)"),
+    file: Optional[UploadFile] = File(None, description="Upload a document file (PDF or image)"),
     file_url: Optional[str] = Form(None, description="URL of the document to process"),
     schema: str = Form(..., description="JSON schema string defining fields to extract (e.g., {\"customer_name\": \"string\", \"invoice_amount\": \"number\"})"),
     authorization: Optional[str] = Header(None)
@@ -650,7 +676,7 @@ async def extract_from_file_or_url(
             logger.info(f"Downloading file from URL: {file_url}")
             file_bytes = download_file_from_url(file_url)
             filename = file_url.split("/")[-1] or "downloaded_file"
-        elif file:
+        elif file is not None:
             logger.info(f"Processing uploaded file: {file.filename}")
             file_bytes = await file.read()
             filename = file.filename or "uploaded_file"
@@ -665,7 +691,11 @@ async def extract_from_file_or_url(
 
         if file_ext == ".pdf":
             text = extract_text_from_pdf_bytes(file_bytes)
-            images = None
+            if not text or len(text.strip()) < 500:
+                images = load_document_as_images(file_bytes, filename)
+                text = None
+            else:
+                images = None
         else:
             images = load_document_as_images(file_bytes, filename)
             text = None
