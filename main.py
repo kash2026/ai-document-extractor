@@ -55,7 +55,10 @@ SUPPORTED_IMAGE_FORMATS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff", ".w
 SUPPORTED_PDF_FORMAT = ".pdf"
 
 # --- API Security ---
-API_TOKEN = os.getenv("API_TOKEN", "kelsa-secret-token")
+API_TOKEN = os.getenv("API_TOKEN")
+if not API_TOKEN:
+    logger.error("API_TOKEN environment variable is not set. Please define it in your .env file.")
+    raise RuntimeError("API_TOKEN environment variable must be set")
 
 def verify_token(authorization: str = Header(None)):
     # Enforce strict token validation

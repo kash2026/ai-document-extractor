@@ -1,21 +1,24 @@
-__pycache__/
-.env
-*.pyc
-*.log
-.DS_Store# Python
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
-.Python
+
+# Virtual environments
 venv/
 env/
-ENV/
-.venv
+.venv/
 
-# Environment variables
+# Environment variables (IMPORTANT)
 .env
 .env.local
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
 
 # IDE
 .vscode/
@@ -24,15 +27,7 @@ ENV/
 *.swo
 *~
 
-# OS
-.DS_Store
-Thumbs.db
-
-# Logs
-*.log
-
 # Temporary files
 *.tmp
 temp/
 tmp/
-
