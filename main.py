@@ -115,7 +115,7 @@ def download_file_from_url(url: str) -> bytes:
     try:
         headers = {
             "User-Agent": "Mozilla/5.0",
-            "Accept": "application/pdf"
+            "Accept": "*/*"
         }
 
         with httpx.Client(timeout=30.0, follow_redirects=True) as client:
@@ -124,11 +124,17 @@ def download_file_from_url(url: str) -> bytes:
 
             content = response.content
 
-            # Validate it's actually a PDF
-            if not content.startswith(b"%PDF"):
+            content_type = response.headers.get("content-type", "").lower()
+
+            # Allow PDF or image files
+            if not (
+                content.startswith(b"%PDF")
+                or "image" in content_type
+                or url.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff"))
+            ):
                 raise HTTPException(
                     status_code=400,
-                    detail="URL did not return a valid PDF file (likely HTML page instead of direct PDF)"
+                    detail="URL did not return a valid document (expected PDF or image)"
                 )
 
             if len(content) > MAX_FILE_SIZE:
