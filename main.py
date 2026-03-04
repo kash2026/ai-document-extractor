@@ -240,6 +240,8 @@ def call_llm_for_extraction(
         "- Extract from visible text OR clearly identifiable context (logo, header, branding).\n"
         "- For certificates/documents, organization is usually present in header, logo, or issuing authority section. Extract that as organization.\n"
         "- Prefer official organization names (e.g., Infosys, Google, TCS) if clearly visible.\n"
+        "- For bank documents (cheques, passbooks, statements), copy numeric fields EXACTLY as shown.\n"
+        "- For cheque numbers, account numbers, IFSC, MICR and similar identifiers, preserve all digits and characters, including leading zeros, with no spaces or formatting changes.\n"
         "- Do NOT hallucinate beyond document context.\n"
         "- Output VALID JSON only.\n"
         "- Follow schema EXACTLY.\n"
@@ -251,6 +253,17 @@ def call_llm_for_extraction(
         system_instruction += "\n\nFix output to exactly match schema. Return JSON only."
 
     schema_prompt = json.dumps(schema, indent=2)
+
+    # Add extra, field-specific guidance when cheque fields are present
+    field_specific_instructions = ""
+    cheque_keys = [k for k in schema.keys() if "cheque" in k.lower()]
+    if cheque_keys:
+        field_specific_instructions = (
+            "\n\nCheque field rules:\n"
+            "- Cheque number is the LEFT-MOST 6-digit group in the MICR line at the bottom of the cheque.\n"
+            "- Ignore 6-digit groups towards the right that relate to branch/sort codes.\n"
+            "- When unsure, prefer the smallest 6-digit number on the MICR line as cheque number.\n"
+        )
 
     if text:
         user_message = f"""
@@ -273,6 +286,7 @@ Schema:
 
 Extract fields from the attached document.
 Return ONLY valid JSON.
+{field_specific_instructions}
 """
 
     # Gemini (primary)
@@ -399,6 +413,35 @@ def validate_and_fix_output(extracted_data: Dict[str, Any], schema: Dict[str, st
     for field_name, field_type in schema.items():
         if field_name in extracted_data:
             value = extracted_data[field_name]
+            # Normalize cheque-related fields to avoid MICR confusion
+            if isinstance(value, str) and "cheque" in field_name.lower():
+                # For strings like "000001 713240002 025678 31",
+                # prefer the LEFT-most 6-digit group; if multiple candidates,
+                # prefer the numerically smallest one (often the cheque number).
+                digit_groups = re.findall(r"\d+", value)
+                six_digit_groups = [g for g in digit_groups if len(g) == 6]
+
+                chosen = None
+                if six_digit_groups:
+                    # Prefer first occurrence, but if there are multiple,
+                    # pick the smallest value which tends to be the cheque number.
+                    chosen = six_digit_groups[0]
+                    try:
+                        numeric_min = min(six_digit_groups, key=lambda g: int(g))
+                        chosen = numeric_min
+                    except ValueError:
+                        # Fall back to first if conversion fails
+                        pass
+                else:
+                    # Fall back to any 6–8 digit group if no exact 6-digit group
+                    for group in digit_groups:
+                        if 6 <= len(group) <= 8:
+                            chosen = group
+                            break
+
+                if chosen:
+                    value = chosen
+
             # Validate type
             if validate_type(value, field_type):
                 validated_data[field_name] = value
